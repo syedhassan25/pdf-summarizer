@@ -1,0 +1,4 @@
+gradio>=5
+pymupdf
+langchain-groq
+langchain-text-splitters
