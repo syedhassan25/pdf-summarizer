@@ -1,6 +1,4 @@
-streamlit
+gradio>=5
 pymupdf
-langchain
 langchain-groq
 langchain-text-splitters
-python-dotenv

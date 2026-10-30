@@ -1,35 +1,28 @@
+"""ResearchAI - research paper summarizer (Gradio + Groq). Deployable on Render / any Python host."""
 import os
 import re
 import time
 import tempfile
 
 import pymupdf as fitz  # PyMuPDF
-import streamlit as st
+import gradio as gr
 from langchain_groq import ChatGroq
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-
 try:
     from dotenv import load_dotenv
     load_dotenv()
 except ImportError:  # production par .env nahi hoti
     pass
 
-# ---------------- Page Config ----------------
-st.set_page_config(
-    page_title="ResearchAI | Paper Summarizer",
-    page_icon="📚",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
-
 # ---------------- Settings ----------------
 MODEL_NAME = os.getenv("MODEL_NAME", "openai/gpt-oss-20b")
-TIER = os.getenv("GROQ_TIER", "free")  # "free" or "paid"
+TIER = os.getenv("GROQ_TIER", "free")  # "free" or "paid" (set as a Space variable)
 MAX_PDF_MB = 20
 MAX_PAGES = int(os.getenv("MAX_PAGES", "60"))
 STRIP_REFERENCES = True
 
 PRESETS = {
+    # Each request (input + output tokens) must stay under the per-minute token cap.
     "free": dict(SINGLE_PASS_LIMIT=14_000, CHUNK_SIZE=12_000, CHUNK_OVERLAP=500,
                  MAX_CONCURRENCY=1, REDUCE_FAN_IN=5, MAP_MAX_TOKENS=1500, REPORT_MAX_TOKENS=3000),
     "paid": dict(SINGLE_PASS_LIMIT=300_000, CHUNK_SIZE=80_000, CHUNK_OVERLAP=2_000,
@@ -41,25 +34,17 @@ CFG = PRESETS[TIER]
 
 
 # ---------------- Models ----------------
-@st.cache_resource
 def make_llm(max_tokens: int) -> ChatGroq:
-    # Streamlit Secrets se ya environment variable se key uthayega
     api_key = os.getenv("GROQ_API_KEY")
     if not api_key:
-        try:
-            api_key = st.secrets["GROQ_API_KEY"]
-        except Exception:
-            pass
-            
-    if not api_key:
         raise RuntimeError(
-            "GROQ_API_KEY is not set. Add it as an environment variable or in Streamlit Secrets."
+            "GROQ_API_KEY is not set. Add it as an environment variable in your hosting dashboard."
         )
     common = dict(model=MODEL_NAME, api_key=api_key, temperature=0.2,
                   max_tokens=max_tokens, max_retries=6, timeout=120)
     try:
-        return ChatGroq(reasoning_effort="low", **common)
-    except Exception as exc:
+        return ChatGroq(reasoning_effort="low", **common)  # gpt-oss: faster, fewer tokens
+    except Exception as exc:  # older langchain-groq without reasoning_effort
         print("reasoning_effort not accepted, using default:", exc)
         return ChatGroq(**common)
 
@@ -70,6 +55,7 @@ llm_report = make_llm(CFG["REPORT_MAX_TOKENS"])
 
 # ---------------- Helpers ----------------
 def extract_text_content(content) -> str:
+    """Convert LLM response content to a clean string."""
     if isinstance(content, str):
         return content
     if isinstance(content, list):
@@ -86,6 +72,7 @@ def extract_text_content(content) -> str:
 
 
 def strip_references(text: str) -> str:
+    """Cut the bibliography if a 'References' heading appears in the last 40% of the text."""
     matches = list(re.finditer(r"\n\s*(references|bibliography)\s*\n", text, flags=re.IGNORECASE))
     for m in reversed(matches):
         if m.start() > len(text) * 0.6:
@@ -195,17 +182,20 @@ RESEARCH INFORMATION:
         yield report
 
 
-# ---------------- Core Pipeline Logic ----------------
-def analyze_paper(pdf_path, status_text_placeholder):
+# ---------------- Main entry point ----------------
+def analyze_paper(pdf_path):
+    if not pdf_path:
+        raise gr.Error("Upload a research paper PDF first.")
     start = time.time()
 
     def elapsed() -> str:
         return f"{time.time() - start:.0f}s"
 
     try:
-        status_text_placeholder.text("Extracting PDF text...")
+        yield "Extracting PDF text...", "", None
         text, pages_with_text = extract_pdf_text(pdf_path)
-        status_text_placeholder.text(f"Extracted {len(text):,} characters from {pages_with_text} pages. Calling Groq...")
+        yield (f"Extracted {len(text):,} characters from {pages_with_text} pages. "
+               f"Calling Groq..."), "", None
 
         if len(text) <= CFG["SINGLE_PASS_LIMIT"]:
             source, n_calls = text, 1
@@ -217,23 +207,21 @@ def analyze_paper(pdf_path, status_text_placeholder):
                 group = chunks[i:i + step]
                 prompts = [map_prompt(c, i + j + 1, len(chunks)) for j, c in enumerate(group)]
                 partials += run_parallel(prompts)
-                status_text_placeholder.text(f"Analyzed {len(partials)}/{len(chunks)} sections... ({elapsed()})")
+                yield f"Analyzed {len(partials)}/{len(chunks)} sections... ({elapsed()})", "", None
 
             n_calls = len(chunks) + 1
             current = partials
             while len(current) > 1:
                 fan = CFG["REDUCE_FAN_IN"]
                 batches = [current[k:k + fan] for k in range(0, len(current), fan)]
-                status_text_placeholder.text(f"Combining summaries ({len(current)} -> {len(batches)})... ({elapsed()})")
+                yield f"Combining summaries ({len(current)} -> {len(batches)})... ({elapsed()})", "", None
                 current = run_parallel([reduce_prompt(b) for b in batches])
                 n_calls += len(batches)
             source = current[0]
 
-        status_text_placeholder.text(f"Writing final report... ({elapsed()})")
         report = ""
-        # Stream output inside the report area dynamically if possible, or fetch final
-        for partial_report in stream_final_report(source):
-            report = partial_report
+        for report in stream_final_report(source):
+            yield f"Writing report... ({elapsed()})", report, None
 
         with tempfile.NamedTemporaryFile(
             mode="w", suffix=".md", prefix="research_summary_",
@@ -242,75 +230,62 @@ def analyze_paper(pdf_path, status_text_placeholder):
             f.write(report)
             output_path = f.name
 
-        status_text_placeholder.text(f"Complete in {elapsed()} · {pages_with_text} pages · {n_calls} API call(s)")
-        return report, output_path
+        yield (f"**Complete** in {elapsed()} · {pages_with_text} pages · "
+               f"{n_calls} API call(s)"), report, output_path
 
+    except gr.Error:
+        raise
     except Exception as exc:
-        raise RuntimeError(f"Could not analyze this PDF: {exc}")
+        print(f"analyze_paper failed: {exc!r}")  # full detail goes to the Space logs
+        raise gr.Error(f"Could not analyze this PDF: {exc}") from exc
 
 
-# ---------------- Streamlit UI ----------------
-st.markdown("<h1 style='text-align: center;'>📚 ResearchAI</h1>", unsafe_allow_html=True)
-st.markdown("<p style='text-align: center; opacity: 0.7;'>Turn lengthy academic papers into structured insights.</p>", unsafe_allow_html=True)
-st.write("---")
+# ---------------- UI ----------------
+CSS = """
+<style>
+.gradio-container {max-width: 1100px !important; margin: auto !important;}
+#hero {text-align: center; padding: 22px 10px 12px;}
+#hero h1 {font-size: 2.2rem; margin-bottom: 6px;}
+#hero p {opacity: .7; font-size: 1rem;}
+</style>
+"""
 
-col1, col2 = st.columns([1, 2], gap="medium")
+with gr.Blocks(title="ResearchAI | Paper Summarizer") as demo:
+    gr.HTML(CSS + """
+    <div id="hero">
+      <h1>📚 ResearchAI</h1>
+      <p>Turn lengthy academic papers into structured insights.</p>
+    </div>
+    """)
 
-with col1:
-    st.subheader("Upload & Settings")
-    uploaded_file = st.file_uploader("Upload research paper", type=[".pdf"])
-    
-    st.info(f"Upload a text-based PDF (max {MAX_PAGES} pages, {MAX_PDF_MB} MB). Scanned PDFs are not supported.")
-    
-    with st.expander("What you'll receive"):
-        st.markdown(
-            "- Executive summary\n"
-            "- Research problem and objectives\n"
-            "- Methodology and key findings\n"
-            "- Technical concepts and limitations\n"
-            "- Conclusion"
-        )
-    
-    analyze_btn = st.button("✨ Analyze Research Paper", type="primary", use_container_width=True)
+    with gr.Row():
+        with gr.Column(scale=1):
+            pdf_input = gr.File(label="Upload research paper", file_types=[".pdf"], type="filepath")
+            analyze_button = gr.Button("✨ Analyze Research Paper", variant="primary", size="lg")
+            status = gr.Markdown(
+                f"Upload a text-based PDF (max {MAX_PAGES} pages, {MAX_PDF_MB} MB). "
+                "Scanned PDFs are not supported."
+            )
+            gr.Markdown(
+                "**What you'll receive**\n"
+                "- Executive summary\n"
+                "- Research problem and objectives\n"
+                "- Methodology and key findings\n"
+                "- Technical concepts and limitations\n"
+                "- Conclusion"
+            )
+        with gr.Column(scale=2):
+            report_output = gr.Markdown(value="Your report will appear here after analysis.")
+            download_output = gr.File(label="Download summary (.md)")
 
-with col2:
-    st.subheader("Analysis Report")
-    status_placeholder = st.empty()
-    report_placeholder = st.empty()
-    download_placeholder = st.empty()
-    
-    report_placeholder.markdown("Your report will appear here after analysis.")
+    analyze_button.click(
+        fn=analyze_paper,
+        inputs=[pdf_input],
+        outputs=[status, report_output, download_output],
+    )
 
-if analyze_btn:
-    if not uploaded_file:
-        st.error("Please upload a research paper PDF first.")
-    else:
-        # Save uploaded file temporarily to disk so pymupdf can read it easily
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
-            tmp_file.write(uploaded_file.getvalue())
-            tmp_path = tmp_file.name
+demo.queue(default_concurrency_limit=2)
 
-        try:
-            with st.spinner("Processing paper through pipeline..."):
-                report_text, md_file_path = analyze_paper(tmp_path, status_placeholder)
-                
-                # Display output report
-                report_placeholder.markdown(report_text)
-                
-                # Setup download button for the markdown report
-                with open(md_file_path, "r", encoding="utf-8") as f:
-                    md_bytes = f.read()
-                
-                download_placeholder.download_button(
-                    label="📥 Download Summary (.md)",
-                    data=md_bytes,
-                    file_name="research_summary.md",
-                    mime="text/markdown",
-                    use_container_width=True
-                )
-        except Exception as e:
-            st.error(str(e))
-        finally:
-            # Clean up temp input pdf
-            if os.path.exists(tmp_path):
-                os.remove(tmp_path)
+if __name__ == "__main__":
+    # Render (and most hosts) provide the port via $PORT and need 0.0.0.0
+    demo.launch(server_name="0.0.0.0", server_port=int(os.getenv("PORT", "7860")))
